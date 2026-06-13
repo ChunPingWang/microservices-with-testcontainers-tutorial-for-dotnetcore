@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>BDD.Tests</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- Reqnroll's xUnit adapter still targets xunit v2; isolate to avoid analyzer conflicts -->
+    <DefineConstants>$(DefineConstants);REQNROLL_XUNIT_V2</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="xunit" />
+    <PackageReference Include="xunit.runner.visualstudio" VersionOverride="2.8.2" />
+    <PackageReference Include="FluentAssertions" />
+    <PackageReference Include="Reqnroll.xUnit" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\ProductService\ProductService.Domain\ProductService.Domain.csproj" />
+    <ProjectReference Include="..\..\src\InventoryService\InventoryService.Domain\InventoryService.Domain.csproj" />
+  </ItemGroup>
+</Project>

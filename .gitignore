@@ -1,0 +1,27 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+.vscode/
+.idea/
+artifacts/
+
+## OS
+.DS_Store
+Thumbs.db
+
+## Tests
+TestResults/
+coverage*.xml
+*.cobertura.xml
+
+## Local secrets
+appsettings.Development.local.json
+.env
+.env.local
+
+## NuGet
+*.nupkg
+packages/

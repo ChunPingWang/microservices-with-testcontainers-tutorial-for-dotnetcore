@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit:
+    name: Unit tests (no containers)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          include-prerelease: true
+      - run: dotnet restore
+      - run: dotnet build --no-restore --configuration Release
+      - run: dotnet test --no-build --configuration Release --filter "Category=Unit"
+
+  contract:
+    name: Contract tests (in-memory)
+    runs-on: ubuntu-latest
+    needs: unit
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          include-prerelease: true
+      - run: dotnet test --filter "Category=Contract"
+
+  integration:
+    name: Integration — ${{ matrix.project }}
+    runs-on: ubuntu-latest
+    needs: unit
+    # Each Infra project owns its own SharedContainerFixture (10 containers).
+    # Running them in the same job back-to-back can intermittently fail on
+    # Elasticsearch startup; parallel jobs sidestep that.
+    strategy:
+      fail-fast: false
+      matrix:
+        project:
+          - tests/ProductService.Infrastructure.Tests
+          - tests/PaymentService.Infrastructure.Tests
+          - tests/InventoryService.Infrastructure.Tests
+          - tests/ProductService.Api.Tests
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          include-prerelease: true
+      - name: Verify Docker
+        run: docker info
+      - run: dotnet test ${{ matrix.project }} --filter "Category=Integration"
+
+  e2e:
+    name: End-to-end (8 containers, nightly / on demand)
+    if: github.event_name == 'workflow_dispatch' || contains(github.event.head_commit.message, '[e2e]')
+    runs-on: ubuntu-latest
+    needs: integration
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+          include-prerelease: true
+      - run: docker info
+      - run: dotnet test --filter "Category=E2E"

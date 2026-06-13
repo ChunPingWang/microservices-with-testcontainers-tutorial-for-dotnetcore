@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>SharedKernel.Domain</RootNamespace>
+    <AssemblyName>SharedKernel.Domain</AssemblyName>
+  </PropertyGroup>
+</Project>
