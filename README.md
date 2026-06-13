@@ -734,7 +734,6 @@ dotnet test tests/ProductService.Infrastructure.Tests --filter "Category=Integra
   - InMemory 實作：`tests/ProductService.Application.Tests/Contract/`
   - Real 實作（Testcontainers）：`tests/ProductService.Infrastructure.Tests/Contract/`
 - BDD：`tests/BDD.Tests/Features/OrderPlacement.feature` + `OrderPlacementSteps.cs`
-- CI：`.github/workflows/ci.yml`（每個 Infrastructure 專案開獨立 job，避免 ES 連跑不穩）
 
 ---
 
@@ -1249,7 +1248,8 @@ back-to-back cold boot 偶發 wait timeout。
 
 **解法**：
 - 本地：一次只跑一個專案 `dotnet test tests/<single-project>/`
-- CI：用 matrix strategy 平行跑（本專案的 `.github/workflows/ci.yml` 已示範）
+- CI：把每個 Infrastructure 專案開獨立 job 平行跑（matrix strategy），別在
+  同一個 job 連續 `dotnet test tests/A; dotnet test tests/B`
 
 ### 9.5 EF Core 的「找不到合適的建構子」
 
