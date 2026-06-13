@@ -314,7 +314,10 @@ dotnet test tests/ProductService.Infrastructure.Tests --filter "Category=Integra
 
 ### 第 6 章：進階主題
 
-- Contract Test：`tests/ProductService.Application.Tests/Contract/OrderRepositoryContract.cs`
+- **Contract Test**（詳見[第 7.8 節](#78-contract-test合約測試保證-fake--real-行為一致)）
+  - 抽象契約：`tests/Contracts/`（OrderRepository、CachePort、SearchPort）
+  - InMemory 實作：`tests/ProductService.Application.Tests/Contract/`
+  - Real 實作（Testcontainers）：`tests/ProductService.Infrastructure.Tests/Contract/`
 - BDD：`tests/BDD.Tests/Features/OrderPlacement.feature` + `OrderPlacementSteps.cs`
 - CI：`.github/workflows/ci.yml`（每個 Infrastructure 專案開獨立 job，避免 ES 連跑不穩）
 
@@ -572,6 +575,120 @@ services.AddMessaging(MessagingProfile.InMemory);
 
 Consumer 程式碼**完全不動**。
 
+### 7.8 Contract Test：合約測試保證 Fake ≡ Real
+
+**為什麼需要契約測試？**
+
+Hexagonal Architecture 的核心好處是 Port 後面可以有多個 Adapter — 真實的 Redis、
+真實的 EF Core，以及拿來做單元測試的 InMemory Fake。但這會帶來一個問題：
+
+> 「我的 Application Handler 在用 `InMemoryCachePort` 時測試通過，
+> 上 production 換成 `RedisCacheAdapter` 後就壞了。」
+
+通常是因為 Fake 跟 Real 行為不一致 — 例如 InMemory 的 TTL 是 `setInterval` 模擬、
+Redis 是真的時鐘；InMemory 沒有 serialization、Redis 走 JSON。**契約測試**就是
+針對 Port 介面寫一份抽象測試，**強迫所有實作都通過同一份斷言**。
+
+```
+              ┌──────────────────────────────────────┐
+              │   tests/Contracts/                   │
+              │   ── OrderRepositoryContract.cs      │  ← 5 條斷言
+              │   ── CachePortContract.cs            │  ← 4 條斷言
+              │   ── SearchPortContract.cs           │  ← 2 條斷言
+              │   (abstract base + factory method)   │
+              └─────────┬────────────────────┬───────┘
+                        │                    │
+              ┌─────────▼──────┐    ┌────────▼──────────────┐
+              │ Application.   │    │ Infrastructure.       │
+              │ Tests/Contract │    │ Tests/Contract        │
+              ├────────────────┤    ├───────────────────────┤
+              │ InMemory       │    │ EfOrderRepository     │
+              │ Fake 提供工廠   │    │ + PostgreSQL container│
+              │                │    │                       │
+              │ RedisCachePort │    │ RedisCacheAdapter     │
+              │ → InMemoryFake │    │ + Redis container     │
+              │                │    │                       │
+              │ Search →       │    │ ElasticSearchAdapter  │
+              │ InMemoryAdapter│    │ + ES container        │
+              └────────────────┘    └───────────────────────┘
+                  跑得快、列          跑得慢、列 Integration，
+                  Contract category   一輪驗證真實行為
+```
+
+**怎麼寫一個契約**：
+
+```csharp
+// tests/Contracts/CachePortContract.cs
+public abstract class CachePortContract
+{
+    protected abstract Task<ICachePort> CreateAsync();   // ← 每個實作覆寫這裡
+
+    [Fact] [Trait("Category", "Contract")]
+    public async Task TTL_ExpiresEntry()
+    {
+        var cache = await CreateAsync();
+        var key = $"key-{Guid.NewGuid()}";
+        await cache.SetAsync(key, new Entry("x", 1), TimeSpan.FromMilliseconds(150));
+        await Task.Delay(500);
+        (await cache.GetAsync<Entry>(key)).Should().BeNull();
+    }
+    // ... 其他斷言
+}
+```
+
+**InMemory 實作端**：
+
+```csharp
+// tests/ProductService.Application.Tests/Contract/CachePortContractTests.cs
+public class InMemoryCachePortContractTests : CachePortContract
+{
+    protected override Task<ICachePort> CreateAsync()
+        => Task.FromResult<ICachePort>(new InMemoryCachePort());
+}
+```
+
+**Real 實作端（同樣四條斷言，跑 Testcontainers Redis）**：
+
+```csharp
+// tests/ProductService.Infrastructure.Tests/Contract/RedisCachePortContractTests.cs
+[Collection("SharedContainers")]
+public class RedisCachePortContractTests(SharedContainerFixture fx) : CachePortContract
+{
+    protected override async Task<ICachePort> CreateAsync()
+    {
+        var redis = await ConnectionMultiplexer.ConnectAsync(fx.Redis.GetConnectionString());
+        await redis.GetServer(redis.GetEndPoints()[0]).FlushAllDatabasesAsync();
+        return new RedisCacheAdapter(redis);
+    }
+}
+```
+
+跑法（同一份斷言，兩個地方各自跑）：
+
+```bash
+# InMemory 變體 — 不需容器，0.5 秒
+dotnet test tests/ProductService.Application.Tests/ --filter "Category=Contract"
+
+# Real 變體 — 需要 Testcontainers，~30 秒（含容器啟動）
+dotnet test tests/ProductService.Infrastructure.Tests/ --filter "Category=Contract"
+```
+
+**契約測試會抓到什麼 bug**：
+
+- InMemory cache 忘了實作 TTL → InMemory 測試會失敗（即使你 RedisCacheAdapter 在 prod 正常）
+- Redis adapter 的 JSON serialization 對 `decimal` 精度有損 → Real 測試會失敗
+- InMemory search 是 substring match、ES 是 BM25 → 用相同斷言寫出來會逼你思考差異是否合理
+
+**本專案目前的契約涵蓋**：
+
+| Port | InMemory 測試（毫秒級） | Real 測試（含 Testcontainers） |
+|---|---|---|
+| `IOrderWriteRepository` | `InMemoryOrderRepositoryContractTests` | `EfOrderRepositoryContractTests` + PG |
+| `ICachePort` | `InMemoryCachePortContractTests` | `RedisCachePortContractTests` + Redis |
+| `ISearchPort` | `InMemorySearchPortContractTests` | `ElasticSearchPortContractTests` + ES |
+
+擴充練習：給 PaymentService 的 `IPaymentWriteRepository` 寫一份契約。
+
 ---
 
 ## 8. 測試金字塔與分類執行
@@ -823,11 +940,19 @@ S3 + Kafka」）也只是再寫一個 if 分支。
   - 加單元測試
   - EF Repository 的 shadow property 邏輯要更新
 
-### Level 2：用 Contract Test 證明你的 Fake 跟 Real 行為一致
+### Level 2：擴充 Contract Test 涵蓋範圍
 
-`tests/ProductService.Application.Tests/Contract/OrderRepositoryContract.cs` 已經示範了
-in-memory 實作怎麼跑契約測試。請你**新增一個** `EfOrderRepositoryContractTests`，
-讓同一份契約測試也用 EF Core + Postgres 容器跑一遍。
+第 7.8 節已經示範 `IOrderWriteRepository`、`ICachePort`、`ISearchPort` 三組契約。
+給你的練習：
+
+1. 為 `PaymentService.Domain.Ports.IPaymentWriteRepository` 寫一份
+   `PaymentRepositoryContract`（放到 `tests/Contracts/`）
+2. 在 `PaymentService.Application.Tests` 加一個 InMemory 變體
+3. 在 `PaymentService.Infrastructure.Tests` 加一個 EF + PostgreSQL 變體
+4. 確認兩邊跑 `--filter Category=Contract` 都是綠的
+
+進階：故意改壞 `InMemoryCachePort.SetAsync`（讓 TTL 沒生效），看契約測試是不是
+真的會抓到 — 這證明契約測試的價值。
 
 ### Level 3：替換 Messaging Transport
 

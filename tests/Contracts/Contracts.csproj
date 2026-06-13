@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RootNamespace>Contracts</RootNamespace>
+    <IsPackable>false</IsPackable>
+    <!-- This project hosts abstract test base classes; it must not be a test runner itself. -->
+    <IsTestProject>false</IsTestProject>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" />
+    <PackageReference Include="FluentAssertions" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\SharedKernel\SharedKernel.Domain\SharedKernel.Domain.csproj" />
+    <ProjectReference Include="..\..\src\ProductService\ProductService.Domain\ProductService.Domain.csproj" />
+  </ItemGroup>
+</Project>

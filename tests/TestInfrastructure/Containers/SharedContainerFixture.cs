@@ -59,10 +59,6 @@ public sealed class SharedContainerFixture : IAsyncLifetime
             .WithEnvironment("discovery.type", "single-node")
             .WithEnvironment("ES_JAVA_OPTS", "-Xms512m -Xmx512m")
             .WithEnvironment("bootstrap.memory_lock", "false")
-            .WithWaitStrategy(Wait.ForUnixContainer()
-                .UntilHttpRequestIsSucceeded(r => r
-                    .ForPath("/_cluster/health?wait_for_status=yellow&timeout=30s")
-                    .ForPort(9200)))
             .Build();
         Keycloak = new KeycloakBuilder().WithImage("quay.io/keycloak/keycloak:25.0").Build();
         Minio = new MinioBuilder().WithImage("minio/minio:latest").Build();

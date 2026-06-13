@@ -24,8 +24,9 @@ public sealed class EfOrderRepository(ProductDbContext db)
 
     public async Task<Order?> FindAsync(OrderId id, CancellationToken ct = default)
     {
-        var order = await db.Orders.FindAsync([id], ct);
-        if (order is not null) await db.Entry(order).Collection("Lines").LoadAsync(ct);
+        // Owned entities auto-load via the query (no separate Collection().LoadAsync()
+        // — that fails when the order is already tracked in the same DbContext).
+        var order = await db.Orders.FirstOrDefaultAsync(o => o.Id == id, ct);
         if (order is not null) RestoreStatusFromShadow(order);
         return order;
     }
