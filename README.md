@@ -197,6 +197,421 @@ public record SearchProductQuery(string? Keyword, int Page, int PageSize)
 - Query 慢了 → 加快取、換 Elasticsearch、加 read replica，都跟 Command 無關
 - 跨切關注（logging、validation）寫成 `IPipelineBehavior<,>`，全域生效
 
+### 4.4 循序圖（Sequence Diagrams）
+
+#### 4.4.1 訂單完整 happy path
+
+從使用者下單到所有三個服務都收斂完成的全鏈路。Kafka topic 在這裡用
+`MassTransit Bus` 統稱。
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant API as ProductService.Api
+    participant POH as PlaceOrderHandler
+    participant POrders as orders (PG)
+    participant Bus as MassTransit (Kafka)
+    participant PayCons as Payment.OrderCreatedConsumer
+    participant PayH as ProcessPaymentHandler
+    participant Vault
+    participant MinIO
+    participant Pay as payments (PG)
+    participant PubSub as GCP Pub/Sub
+    participant InvCons as Inventory.OrderCreatedConsumer
+    participant InvH as DeductStockHandler
+    participant Lock as Redis Lock
+    participant Stocks as stocks (PG)
+    participant ProdCons as Product.{PaymentCompleted,InventoryDeducted}Consumer
+
+    User->>API: POST /api/orders {lines}
+    API->>POH: PlaceOrderCommand
+    POH->>POrders: AddAsync(order, Created)
+    POH->>Bus: Publish OrderCreatedIntegrationEvent
+    API-->>User: 201 Created {orderId}
+
+    par 支付流程
+        Bus-->>PayCons: OrderCreated
+        PayCons->>PayH: ProcessPaymentCommand(idem=order-{id})
+        PayH->>Pay: FindByIdempotency(idem)
+        PayH->>Vault: GetSecret("payment", "psp_api_key")
+        Vault-->>PayH: token
+        PayH->>MinIO: StoreAsync(receipt PDF)
+        MinIO-->>PayH: receiptKey
+        PayH->>Pay: AddAsync(Pending) → UpdateAsync(Completed)
+        PayH->>Bus: Publish PaymentCompleted
+        PayH->>PubSub: Notify(payment.completed)
+    and 庫存流程
+        Bus-->>InvCons: OrderCreated
+        InvCons->>InvH: DeductStockCommand
+        InvH->>Lock: AcquireAsync("stock:{productId}")
+        InvH->>Stocks: GetMany → Allocate → Commit
+        InvH->>Stocks: UpdateAsync (concurrency token++)
+        InvH->>Lock: Dispose
+        InvH->>Bus: Publish InventoryDeducted
+    end
+
+    Bus-->>ProdCons: PaymentCompleted
+    ProdCons->>POrders: MarkPaidCommand → UpdateAsync(Paid)
+    Bus-->>ProdCons: InventoryDeducted
+    ProdCons->>POrders: CompleteOrderCommand → UpdateAsync(Completed)
+```
+
+#### 4.4.2 Saga 補償：庫存不足觸發退款
+
+當庫存配貨失敗，Payment 收到失敗事件後退款，最終狀態收斂為 `Refunded`。
+
+```mermaid
+sequenceDiagram
+    participant Bus as MassTransit
+    participant InvH as DeductStockHandler
+    participant Stocks as stocks (PG)
+    participant PayCons as Payment.InventoryDeductionFailedConsumer
+    participant PayH as RefundPaymentByOrderHandler
+    participant Pay as payments (PG)
+    participant ProdCons as Product.PaymentFailedConsumer
+    participant POrders as orders (PG)
+
+    InvH->>Stocks: GetMany
+    InvH-->>InvH: AllocateAll throws DomainException
+    InvH->>Bus: Publish InventoryDeductionFailed(orderId, reason)
+    Bus-->>PayCons: InventoryDeductionFailed
+    PayCons->>PayH: RefundPaymentByOrderCommand
+    PayH->>Pay: FindByOrderAsync(orderId)
+    PayH->>Pay: UpdateAsync(Refunded)
+    PayH->>Bus: Publish PaymentFailed(orderId, reason)
+    Bus-->>ProdCons: PaymentFailed
+    ProdCons->>POrders: RefundOrderCommand
+    POrders-->>POrders: Order status = Refunded
+```
+
+#### 4.4.3 冪等性：同一張訂單重送支付請求
+
+`PaymentService` 的 `ProcessPaymentCommand` 帶 `IdempotencyKey = order-{orderId}`。
+重送同一訂單時，handler 從 DB 撈出已存在的 payment 直接回應，不會二次扣款。
+
+```mermaid
+sequenceDiagram
+    participant Bus
+    participant PayCons as Payment.OrderCreatedConsumer
+    participant PayH as ProcessPaymentHandler
+    participant Pay as payments (PG)
+
+    Bus-->>PayCons: OrderCreated (重送)
+    PayCons->>PayH: ProcessPaymentCommand(idem=order-{id})
+    PayH->>Pay: FindByIdempotencyAsync(idem)
+    alt 已存在
+        Pay-->>PayH: existing Payment
+        PayH-->>PayCons: return existing.Id (no side-effects)
+    else 不存在
+        PayH->>Pay: 正常流程（扣款 + 存收據 + 發事件）
+    end
+```
+
+### 4.5 類別圖（Class Diagrams）
+
+#### 4.5.1 ProductService Domain Model
+
+`Order` 是聚合根，內含 `OrderLine` 集合與當前 `OrderStatus`（多型 sealed record）。
+
+```mermaid
+classDiagram
+    direction LR
+    class Order {
+        +OrderId Id
+        +CustomerId CustomerId
+        +Money Total
+        +OrderStatus Status
+        +IReadOnlyList~OrderLine~ Lines
+        +IReadOnlyList~OrderEvent~ DomainEvents
+        -List~OrderLine~ _lines
+        +Place(customer, lines) Order$
+        +MarkPaid(paymentId)
+        +MarkCompleted()
+        +Cancel(reason)
+        +Refund(reason)
+        +ClearDomainEvents()
+    }
+    class OrderLine {
+        +ProductId ProductId
+        +Quantity Quantity
+        +Money UnitPrice
+        +Money LineTotal
+        +Create(pid, qty, price)$ OrderLine
+    }
+    class Product {
+        +ProductId Id
+        +string Name
+        +string Description
+        +Money Price
+        +bool IsActive
+        +Rename(newName)
+        +Reprice(newPrice)
+        +Deactivate()
+    }
+    class OrderStatus {
+        <<abstract>>
+        +string Name
+    }
+    class Created
+    class Paid
+    class Completed
+    class Cancelled
+    class Refunded
+    OrderStatus <|-- Created : sealed record
+    OrderStatus <|-- Paid : sealed record (PaymentId)
+    OrderStatus <|-- Completed : sealed record
+    OrderStatus <|-- Cancelled : sealed record (Reason)
+    OrderStatus <|-- Refunded : sealed record (Reason)
+    class PricingService {
+        +PriceLines(drafts, catalog) Money
+        +BuildLines(drafts, catalog) OrderLine[]
+    }
+    Order o--> "1..*" OrderLine
+    Order ..> OrderStatus
+    PricingService ..> Product
+    PricingService ..> OrderLine
+```
+
+#### 4.5.2 Hexagonal Port/Adapter（以快取為例）
+
+同一個 `ICachePort` 介面被 Domain/Application 層用來注入；Infrastructure 提供
+Redis（正式）與 InMemory（開發 / Application 單元測試）兩個 Adapter。
+
+```mermaid
+classDiagram
+    direction LR
+    namespace Domain {
+        class ICachePort {
+            <<interface>>
+            +GetAsync(key) T?
+            +SetAsync(key, value, ttl)
+            +RemoveAsync(key)
+        }
+    }
+    namespace Application {
+        class SearchProductQueryHandler {
+            -ISearchPort search
+            -ICachePort cache
+            +Handle(query)
+        }
+    }
+    namespace Infrastructure {
+        class RedisCacheAdapter {
+            -IConnectionMultiplexer redis
+        }
+        class InMemoryCachePort {
+            -Dictionary~string,object~ store
+        }
+    }
+    ICachePort <|.. RedisCacheAdapter : implements
+    ICachePort <|.. InMemoryCachePort : implements
+    SearchProductQueryHandler ..> ICachePort : depends on (DI)
+```
+
+#### 4.5.3 PaymentService Domain
+
+`IdempotencyKey` 是 value object；`Payment` 聚合的狀態用 sealed record 表達，
+`Completed` 自帶 receipt 路徑、`Refunded`/`Failed` 自帶 reason。
+
+```mermaid
+classDiagram
+    direction LR
+    class Payment {
+        +PaymentId Id
+        +OrderId OrderId
+        +Money Amount
+        +IdempotencyKey Idempotency
+        +PaymentStatus Status
+        +Create(orderId, amount, idem)$ Payment
+        +MarkCompleted(receiptKey)
+        +MarkFailed(reason)
+        +Refund(reason)
+    }
+    class IdempotencyKey {
+        <<value object>>
+        +string Value
+        +Of(raw)$ IdempotencyKey
+    }
+    class PaymentStatus {
+        <<abstract>>
+    }
+    class Pending
+    class CompletedP as Completed
+    class Failed
+    class RefundedP as Refunded
+    PaymentStatus <|-- Pending
+    PaymentStatus <|-- CompletedP : (ReceiptKey)
+    PaymentStatus <|-- Failed : (Reason)
+    PaymentStatus <|-- RefundedP : (Reason)
+    Payment o--> IdempotencyKey
+    Payment ..> PaymentStatus
+```
+
+#### 4.5.4 InventoryService Domain
+
+`Stock` 有 EF Core 樂觀鎖（`Version`），`StockAllocationService` 做 all-or-nothing 配貨。
+
+```mermaid
+classDiagram
+    direction LR
+    class Stock {
+        +StockId Id
+        +ProductId ProductId
+        +Quantity Available
+        +Quantity Reserved
+        +uint Version
+        +Create(pid, initial)$ Stock
+        +Reserve(qty)
+        +Commit(qty)
+        +Release(qty)
+        +Restock(qty)
+    }
+    class StockAllocationService {
+        +AllocateAll(lines, stocks)
+        +CommitAll(lines, stocks)
+        +ReleaseAll(lines, stocks)
+    }
+    class AllocationLine {
+        +ProductId ProductId
+        +int Quantity
+    }
+    class IDistributedLock {
+        <<interface>>
+        +AcquireAsync(resource, expiry, timeout) IAsyncDisposable
+    }
+    class RedisDistributedLock
+    class SemaphoreDistributedLock
+    IDistributedLock <|.. RedisDistributedLock
+    IDistributedLock <|.. SemaphoreDistributedLock
+    StockAllocationService ..> Stock
+    StockAllocationService ..> AllocationLine
+```
+
+### 4.6 ER 圖（資料庫綱要）
+
+#### 4.6.1 ProductService Database
+
+`orders.status_*` 是 shadow property — sealed record `OrderStatus` 拆解後的四個
+持久化欄位，由 `EfOrderRepository.WriteStatusShadow` / `RestoreStatusFromShadow` 對應。
+`order_lines` 是 owned entity，主鍵 `line_seq` 自動產生。
+
+```mermaid
+erDiagram
+    products {
+        uuid id PK
+        string name
+        string description
+        decimal price_amount
+        string price_currency
+        bool is_active
+        string image_storage_key "nullable"
+    }
+    orders {
+        uuid id PK
+        uuid customer_id
+        decimal total_amount
+        string total_currency
+        string status_name "Created/Paid/Completed/Cancelled/Refunded"
+        timestamp status_at_utc
+        uuid status_payment_id "nullable, set when Paid"
+        string status_reason "nullable, set when Cancelled/Refunded"
+    }
+    order_lines {
+        int line_seq PK "auto-increment per order"
+        uuid order_id FK
+        uuid product_id
+        int quantity
+        decimal unit_price_amount
+        string unit_price_currency
+    }
+    orders ||--o{ order_lines : "owns (cascade)"
+```
+
+#### 4.6.2 PaymentService Database
+
+`idempotency_key` 唯一索引保證同訂單事件重送時不會二次扣款；
+shadow property `status_receipt_key` / `status_reason` 對應 `Completed`/`Failed`/`Refunded` 三狀態。
+
+```mermaid
+erDiagram
+    payments {
+        uuid id PK
+        uuid order_id "indexed"
+        decimal amount
+        string currency
+        string idempotency_key UK "unique, max 128 chars"
+        string status_name "Pending/Completed/Failed/Refunded"
+        timestamp status_at_utc
+        string status_receipt_key "nullable, set when Completed"
+        string status_reason "nullable, set when Failed/Refunded"
+    }
+```
+
+#### 4.6.3 InventoryService Database
+
+`version` 是 EF Core 樂觀鎖 token — `EfStockRepository.UpdateAsync` 每次 +1，
+並發更新時 SQL 會帶 `WHERE version = @originalVersion`，後者寫入時拋
+`DbUpdateConcurrencyException`。
+
+```mermaid
+erDiagram
+    stocks {
+        uuid id PK
+        uuid product_id UK "unique"
+        int available
+        int reserved
+        uint version "EF Core concurrency token"
+    }
+```
+
+#### 4.6.4 物理部署視角
+
+三個服務各自獨立資料庫（database-per-service 模式），中間用 Kafka 解耦。
+
+```mermaid
+flowchart LR
+    Client(["瀏覽器 / cURL"])
+    subgraph Product["ProductService"]
+        PApi[Minimal API]
+        PDB[(products + orders<br/>+ order_lines)]
+    end
+    subgraph Payment["PaymentService"]
+        PayApi[Minimal API]
+        PayDB[(payments)]
+    end
+    subgraph Inventory["InventoryService"]
+        InvApi[Minimal API]
+        InvDB[(stocks)]
+    end
+    Kafka{{"Kafka<br/>(MassTransit)"}}
+    Redis[(Redis<br/>cache + lock)]
+    ES[(Elasticsearch<br/>product search)]
+    Vault[(Vault)]
+    MinIO[(MinIO<br/>receipts + images)]
+    PubSub{{"GCP Pub/Sub<br/>notifications"}}
+    Keycloak[(Keycloak<br/>JWT)]
+
+    Client -->|JWT| PApi
+    PApi --> PDB
+    PApi --> Redis
+    PApi --> ES
+    PApi --> MinIO
+    PApi --> Keycloak
+    PApi --> Kafka
+
+    Kafka --> PayApi
+    PayApi --> PayDB
+    PayApi --> Vault
+    PayApi --> MinIO
+    PayApi --> PubSub
+    PayApi --> Kafka
+
+    Kafka --> InvApi
+    InvApi --> InvDB
+    InvApi --> Redis
+    InvApi --> Kafka
+```
+
 ---
 
 ## 5. 程式碼地圖
