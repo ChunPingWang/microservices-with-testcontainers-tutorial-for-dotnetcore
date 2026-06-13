@@ -1,4 +1,4 @@
-# Testcontainers 電商微服務教程（.NET 10 · C# 14）
+# dot Net Core 微服務應用 — Testcontainers 學習專案
 
 > 用一個真正會跑的電商範例，學會 **DDD + CQRS + Hexagonal Architecture**，
 > 並用 **Testcontainers for .NET** 把所有外部依賴搬進測試裡驗證。
